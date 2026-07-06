@@ -27,7 +27,7 @@ from app.config.constants import ICARUS_NAME, ICARUS_BANNER
 
 
 # ── Log directory ──────────────────────────────────────────────────
-LOG_DIR = Path(__file__).resolve().parents[4] / "logs"
+LOG_DIR = Path(__file__).resolve().parents[3] / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "icarus.log"
 
