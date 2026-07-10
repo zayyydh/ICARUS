@@ -1,19 +1,10 @@
 """
-ICARUS LLM Manager
-===================
-The single entry point for all LLM interactions.
-Every module imports THIS — never a provider directly.
-
-Reads LLM_PROVIDER from .env and returns the right provider.
-Swapping models = one line in .env. Zero code changes.
-
-Usage anywhere in ICARUS:
-    from app.llm.manager import llm
-    response = await llm.chat(messages, config)
+ICARUS LLM Manager — v2
+=========================
+Now injects personality-aware system prompts into every LLM call.
 """
 
 import logging
-
 from app.llm.base import BaseLLMProvider, Message, LLMConfig, LLMResponse, Role
 from app.config.settings import settings
 
@@ -21,44 +12,20 @@ logger = logging.getLogger(__name__)
 
 
 def _load_provider() -> BaseLLMProvider:
-    """
-    Reads LLM_PROVIDER from settings and instantiates
-    the correct provider. Called once at startup.
-    """
     provider = settings.LLM_PROVIDER
-
     if provider == "gemini":
         from app.llm.gemini import GeminiProvider
         logger.info("LLM provider loaded", extra={"provider": "gemini"})
         return GeminiProvider()
-
     elif provider == "claude":
-        raise NotImplementedError(
-            "Claude provider not yet implemented. "
-            "Set LLM_PROVIDER=gemini in .env"
-        )
-
+        raise NotImplementedError("Claude provider coming soon.")
     elif provider == "ollama":
-        raise NotImplementedError(
-            "Ollama provider not yet implemented. "
-            "Set LLM_PROVIDER=gemini in .env"
-        )
-
+        raise NotImplementedError("Ollama provider coming soon.")
     else:
-        raise ValueError(
-            f"Unknown LLM provider: '{provider}'. "
-            f"Valid options: gemini, claude, ollama"
-        )
+        raise ValueError(f"Unknown LLM provider: '{provider}'")
 
 
 class LLMManager:
-    """
-    Thin wrapper around the active provider.
-    Adds logging, error handling, and convenience methods
-    on top of the raw provider interface.
-
-    This is what the Brain, Tools, and RAG engine all use.
-    """
 
     def __init__(self):
         self._provider = _load_provider()
@@ -85,35 +52,36 @@ class LLMManager:
         personality: str = "",
         language:    str = "",
     ) -> LLMResponse:
-        """
-        Main method for all ICARUS LLM calls.
-
-        Args:
-            messages:    Conversation history + current message
-            config:      Optional per-request LLM settings
-            personality: Active personality name — injected into system prompt
-            language:    Detected language — injected into system prompt
-
-        Returns:
-            LLMResponse with content, token counts, provider info
-        """
         if config is None:
             config = LLMConfig(
                 temperature=settings.LLM_TEMPERATURE,
                 max_tokens=settings.LLM_MAX_TOKENS,
             )
 
-        # Inject personality and language context into system prompt
+        # Build personality-aware system prompt injection
         context_parts = []
+
         if personality:
-            context_parts.append(f"Active personality: {personality}")
+            try:
+                from app.personality.manager import personality_manager
+                personality_prompt = personality_manager.build_prompt(
+                    personality, language
+                )
+                context_parts.append(personality_prompt)
+            except Exception as e:
+                logger.warning(
+                    "Could not load personality prompt",
+                    extra={"error": str(e)}
+                )
+                context_parts.append(f"Active personality: {personality}")
+
         if language:
             context_parts.append(
-                f"User's language: {language} — reply in this language"
+                f"User language: {language} — reply in this language"
             )
 
         if context_parts:
-            config.system = "\n".join(context_parts)
+            config.system = "\n\n".join(context_parts)
 
         logger.debug(
             "LLM chat request",
@@ -137,28 +105,12 @@ class LLMManager:
         return response
 
     async def quick(self, prompt: str, system: str = "") -> str:
-        """
-        One-shot prompt → response string.
-        For simple internal tasks that don't need history.
-
-        Usage:
-            text = await llm.quick("Summarize this in 2 sentences: ...")
-        """
         messages = [Message(role=Role.USER, content=prompt)]
-        config   = LLMConfig(
-            temperature=0.3,
-            max_tokens=512,
-            system=system,
-        )
+        config   = LLMConfig(temperature=0.3, max_tokens=512, system=system)
         response = await self._provider.chat(messages, config)
         return response.content
 
-    async def stream(
-        self,
-        messages: list[Message],
-        config:   LLMConfig | None = None,
-    ):
-        """Streaming passthrough to active provider."""
+    async def stream(self, messages: list[Message], config: LLMConfig | None = None):
         if config is None:
             config = LLMConfig(
                 temperature=settings.LLM_TEMPERATURE,
@@ -168,11 +120,8 @@ class LLMManager:
             yield chunk
 
     async def health_check(self) -> bool:
-        """Check if the active LLM provider is reachable."""
         return await self._provider.health_check()
 
 
 # ── Singleton ──────────────────────────────────────────────────────
-# Import this everywhere. One instance, loaded once.
-# All modules share the same provider connection.
 llm = LLMManager()
