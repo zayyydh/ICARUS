@@ -166,8 +166,10 @@ INTENT_TRIGGERS: dict[INTENT, list[str]] = {
     ],
 
     INTENT.CODE_RUN: [
-        "run", "execute", "chala", "chalao", "run this",
+        "run", "execute", "run this",
+        "run code", "script run"
         "run code", "script chala",
+        "chala", "chalao", "run this",
     ],
     INTENT.CODE_DEBUG: [
         "debug", "error fix", "why is this not working",

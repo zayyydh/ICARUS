@@ -65,7 +65,7 @@ class IcarusSettings(BaseSettings):
         description="Google Gemini API key — get from aistudio.google.com"
     )
     GEMINI_MODEL: str = Field(
-        default="gemini-1.5-flash",
+        default="gemini-2.5-flash",
         description="Gemini model name"
     )
     LLM_TEMPERATURE: float = Field(
