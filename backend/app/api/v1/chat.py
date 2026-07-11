@@ -1,14 +1,12 @@
 """
-ICARUS Chat endpoint — v2
+ICARUS Chat endpoint — v3
 ==========================
-Now routes through the Orchestrator instead of calling LLM directly.
-The Orchestrator handles routing, tools, memory, and personality.
-
-POST /api/v1/chat        → full conversation with history
-POST /api/v1/chat/quick  → one-shot prompt, no history
+Now session-aware and memory-backed.
+Pass a session_id to maintain conversation across requests.
 """
 
 import logging
+import uuid
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -27,6 +25,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message:     str               = Field(..., min_length=1, max_length=8_000)
+    session_id:  str               = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     history:     list[ChatMessage] = Field(default_factory=list)
     language:    str               = Field(default="hinglish")
     personality: str               = Field(default="bro")
@@ -39,6 +38,7 @@ class ChatResponse(BaseModel):
     tokens_used: int
     personality: str
     language:    str
+    session_id:  str
 
 class QuickRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=4_000)
@@ -50,19 +50,19 @@ class QuickResponse(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────
 
-@router.post(
-    "",
-    response_model=ChatResponse,
-    summary="Chat with ICARUS",
-    description="Full conversation endpoint — routes through Orchestrator.",
-)
+@router.post("", response_model=ChatResponse, summary="Chat with ICARUS")
 async def chat(request: ChatRequest) -> ChatResponse:
+    """
+    Main ICARUS chat endpoint.
+    Pass the same session_id across requests to maintain memory.
+    ICARUS remembers your conversation history automatically.
+    """
     logger.info(
         "Chat request",
         extra={
+            "session_id":  request.session_id,
             "language":    request.language,
             "personality": request.personality,
-            "history_len": len(request.history),
         }
     )
 
@@ -77,6 +77,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             language=request.language,
             personality=request.personality,
             history=history,
+            session_id=request.session_id,
         )
 
         return ChatResponse(
@@ -87,21 +88,18 @@ async def chat(request: ChatRequest) -> ChatResponse:
             tokens_used=response.tokens_used,
             personality=response.personality,
             language=response.language,
+            session_id=response.session_id,
         )
 
     except Exception as e:
-        logger.error("Chat endpoint error", extra={"error": str(e)})
+        logger.error("Chat error", extra={"error": str(e)})
         raise HTTPException(
             status_code=500,
             detail=f"{ICARUS_NAME} error: {str(e)}"
         )
 
 
-@router.post(
-    "/quick",
-    response_model=QuickResponse,
-    summary="One-shot prompt",
-)
+@router.post("/quick", response_model=QuickResponse, summary="One-shot prompt")
 async def quick_chat(request: QuickRequest) -> QuickResponse:
     try:
         from app.llm.manager import llm

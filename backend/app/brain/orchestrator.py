@@ -1,37 +1,18 @@
 """
-ICARUS Orchestrator
-====================
-The central coordinator of ICARUS.
+ICARUS Orchestrator — v2
+=========================
+Now fully memory-aware.
 
-Receives a RouteResult from the Intent Router and decides:
-  - Which tools to call
-  - Whether to use the LLM
-  - How to build the final prompt
-  - What to return to the user
-
-The Orchestrator is the only module that knows about everything.
-Every other module knows only about its own domain.
-
-Flow:
-  User input
-      │
-  Intent Router    → RouteResult
-      │
-  Orchestrator     → coordinates tools + LLM + memory + personality
-      │
-  Final response   → text back to user
-
-Usage:
-    from app.brain.orchestrator import orchestrator
-    response = await orchestrator.handle(
-        text="gana baja Kesariya",
-        language="hinglish",
-        personality="bro",
-        history=[],
-    )
+Every request:
+  1. Loads conversation history from short-term memory (Redis)
+  2. Loads user facts from long-term memory (SQLite)
+  3. Searches vector memory for relevant past context
+  4. Routes intent → tool or LLM
+  5. Saves the exchange back to all memory layers
 """
 
 import logging
+import random
 from dataclasses import dataclass, field
 
 from app.brain.intent_router import router as intent_router, RouteResult
@@ -39,6 +20,9 @@ from app.config.constants import INTENT, TOOL, THINKING_SOUNDS, LANGUAGE
 from app.config.settings import settings
 from app.llm.manager import llm
 from app.llm.base import Message, Role, LLMConfig
+from app.memory.short_term import short_term_memory
+from app.memory.long_term import long_term_memory
+from app.memory.vector_store import vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -49,28 +33,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OrchestratorResponse:
-    """
-    Everything the API layer needs to respond to the user.
-
-    text:           The final reply text
-    intent:         What ICARUS understood the user wanted
-    used_llm:       Whether Gemini was involved
-    used_tool:      Which tool was called (if any)
-    tool_output:    Raw tool result (for debugging)
-    thinking_sound: Short sound to play while processing (voice UX)
-    tokens_used:    LLM tokens consumed (0 if no LLM call)
-    personality:    Active personality that shaped the response
-    language:       Language the response is in
-    """
     text:           str
     intent:         str
-    used_llm:       bool               = False
-    used_tool:      str | None         = None
-    tool_output:    dict | None        = None
-    thinking_sound: str                = ""
-    tokens_used:    int                = 0
-    personality:    str                = "bro"
-    language:       str                = "hinglish"
+    used_llm:       bool            = False
+    used_tool:      str | None      = None
+    tool_output:    dict | None     = None
+    thinking_sound: str             = ""
+    tokens_used:    int             = 0
+    personality:    str             = "bro"
+    language:       str             = "hinglish"
+    session_id:     str             = ""
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -78,15 +50,6 @@ class OrchestratorResponse:
 # ══════════════════════════════════════════════════════════════════
 
 class Orchestrator:
-    """
-    Coordinates the full ICARUS response pipeline.
-
-    Design principles:
-    1. Try tools first — LLM is last resort, not first instinct
-    2. Every path returns an OrchestratorResponse — no exceptions escape
-    3. Personality and language are injected at the LLM layer
-    4. Tool failures degrade gracefully — ICARUS explains what went wrong
-    """
 
     def __init__(self):
         logger.info("Orchestrator initialized")
@@ -96,15 +59,17 @@ class Orchestrator:
     async def handle(
         self,
         text:        str,
-        language:    str = "hinglish",
-        personality: str = "bro",
+        language:    str  = "hinglish",
+        personality: str  = "bro",
         history:     list[dict] | None = None,
+        session_id:  str  = "",
     ) -> OrchestratorResponse:
         """
         Handle any user input end-to-end.
-        This is the single method the API layer calls.
+        Now memory-aware — loads and saves across all three layers.
         """
-        history = history or []
+        history    = history or []
+        session_id = session_id or self._new_session_id()
 
         logger.info(
             "Orchestrator handling request",
@@ -112,63 +77,181 @@ class Orchestrator:
                 "text":        text[:60],
                 "language":    language,
                 "personality": personality,
+                "session_id":  session_id,
             }
         )
 
-        # Step 1 — Route the intent
+        # ── Step 1: Load short-term history from Redis ─────────────
+        # If caller passed history, use it. Otherwise load from Redis.
+        if not history:
+            history = await short_term_memory.get(session_id)
+
+        # ── Step 2: Load user facts from long-term memory ──────────
+        memory_context = await long_term_memory.build_memory_context()
+
+        # ── Step 3: Check if this is a memory save/recall command ──
         route = await intent_router.route(text)
 
-        logger.info(
-            "Intent routed",
-            extra={
-                "intent":     route.intent.value,
-                "use_llm":    route.use_llm,
-                "tool":       route.tool.value if route.tool else None,
-                "confidence": route.confidence,
-            }
-        )
+        if route.intent == INTENT.MEMORY_SAVE:
+            return await self._handle_memory_save(
+                text, route, language, personality,
+                session_id, memory_context
+            )
 
-        # Step 2 — Pick thinking sound for voice UX
+        if route.intent == INTENT.MEMORY_RECALL:
+            return await self._handle_memory_recall(
+                text, route, language, personality,
+                session_id, memory_context
+            )
+
+        # ── Step 4: Search vector memory for relevant past context ──
+        vector_context = await vector_store.recall_relevant(text)
+
+        # ── Step 5: Pick thinking sound ────────────────────────────
         thinking_sound = self._pick_thinking_sound(language)
 
-        # Step 3 — Route to appropriate handler
+        # ── Step 6: Route to handler ───────────────────────────────
         try:
             if route.intent == INTENT.PERSONALITY_SWITCH:
-                return await self._handle_personality_switch(
+                response = await self._handle_personality_switch(
                     route, language, thinking_sound
                 )
 
-            if route.intent == INTENT.ICARUS_STATUS:
-                return await self._handle_status(
+            elif route.intent == INTENT.ICARUS_STATUS:
+                response = await self._handle_status(
+                    route, language, personality,
+                    thinking_sound, memory_context
+                )
+
+            elif route.intent == INTENT.ICARUS_HELP:
+                response = await self._handle_help(
                     route, language, personality, thinking_sound
                 )
 
-            if route.intent == INTENT.ICARUS_HELP:
-                return await self._handle_help(
+            elif route.is_direct_tool:
+                response = await self._handle_tool(
                     route, language, personality, thinking_sound
                 )
 
-            if route.is_direct_tool:
-                return await self._handle_tool(
-                    route, language, personality, thinking_sound
+            else:
+                response = await self._handle_llm(
+                    text, route, language, personality,
+                    history, thinking_sound,
+                    memory_context, vector_context
                 )
 
-            # Default — LLM handles it
-            return await self._handle_llm(
-                text, route, language, personality,
-                history, thinking_sound
-            )
+            response.session_id = session_id
 
         except Exception as e:
             logger.error(
                 "Orchestrator error",
                 extra={"error": str(e), "intent": route.intent.value}
             )
-            return self._error_response(
-                e, route.intent.value, language, personality, thinking_sound
+            response = self._error_response(
+                e, route.intent.value, language,
+                personality, thinking_sound, session_id
             )
 
-    # ── Handlers ──────────────────────────────────────────────────
+        # ── Step 7: Save exchange to memory ───────────────────────
+        await self._save_to_memory(
+            session_id=session_id,
+            user_text=text,
+            icarus_text=response.text,
+            intent=route.intent.value,
+        )
+
+        return response
+
+    # ── Memory handlers ───────────────────────────────────────────
+
+    async def _handle_memory_save(
+        self,
+        text:           str,
+        route:          RouteResult,
+        language:       str,
+        personality:    str,
+        session_id:     str,
+        memory_context: str,
+    ) -> OrchestratorResponse:
+        """Extract and save a fact from user input."""
+
+        # Ask LLM to extract the key fact
+        extract_prompt = (
+            f"The user said: '{text}'\n"
+            f"They want you to remember something. "
+            f"Extract: (1) a short snake_case key, (2) the value to remember.\n"
+            f"Reply in JSON only: {{\"key\": \"...\", \"value\": \"...\"}}"
+        )
+        raw = await llm.quick(extract_prompt)
+
+        try:
+            import json
+            # Strip markdown fences if present
+            clean = raw.strip().strip("```json").strip("```").strip()
+            parsed = json.loads(clean)
+            key   = parsed.get("key", "user_note")
+            value = parsed.get("value", text)
+        except Exception:
+            key   = "user_note"
+            value = text
+
+        await long_term_memory.save(key, value, category="user_fact")
+
+        confirmations = {
+            "hinglish": f"Yaad kar liya — {value}",
+            "hi":       f"Yaad aa gaya — {value}",
+            "en":       f"Got it, I'll remember — {value}",
+            "mr":       f"Lakshat thevle — {value}",
+        }
+        reply = confirmations.get(language, confirmations["hinglish"])
+
+        return OrchestratorResponse(
+            text=reply,
+            intent=route.intent.value,
+            used_llm=True,
+            personality=personality,
+            language=language,
+        )
+
+    async def _handle_memory_recall(
+        self,
+        text:           str,
+        route:          RouteResult,
+        language:       str,
+        personality:    str,
+        session_id:     str,
+        memory_context: str,
+    ) -> OrchestratorResponse:
+        """Search memory and answer a recall question."""
+        # Search both long-term and vector memory
+        lt_context = await long_term_memory.build_memory_context()
+        vt_context = await vector_store.recall_relevant(text)
+
+        combined = "\n\n".join(filter(None, [lt_context, vt_context]))
+
+        prompt_msg = (
+            f"The user is asking you to recall something: '{text}'\n\n"
+            f"Here is what you know:\n{combined}\n\n"
+            f"Answer based on this. If you don't know, say so honestly."
+        )
+
+        messages = [Message(role=Role.USER, content=prompt_msg)]
+        response = await llm.chat(
+            messages=messages,
+            personality=personality,
+            language=language,
+        )
+
+        return OrchestratorResponse(
+            text=response.content,
+            intent=route.intent.value,
+            used_llm=True,
+            tokens_used=response.total_tokens,
+            personality=personality,
+            language=language,
+        )
+
+    # ── Core handlers ─────────────────────────────────────────────
 
     async def _handle_tool(
         self,
@@ -177,27 +260,12 @@ class Orchestrator:
         personality:    str,
         thinking_sound: str,
     ) -> OrchestratorResponse:
-        """
-        Direct tool execution — no LLM involved.
-        Fast path for deterministic actions like playing music.
-        """
-        tool_name = route.tool.value if route.tool else "unknown"
-        logger.info(
-            "Executing tool directly",
-            extra={"tool": tool_name, "params": route.params}
-        )
-
-        # Tool registry lookup — Phase 4 will wire real tools here
-        # For now, return a structured stub so the pipeline works end-to-end
+        tool_name   = route.tool.value if route.tool else "unknown"
         tool_result = await self._execute_tool(route)
 
         if tool_result.get("success"):
-            # Tool succeeded — confirm in user's language without LLM
-            text = self._tool_success_message(
-                route.intent, route.params, language
-            )
+            text = self._tool_success_message(route.intent, route.params, language)
         else:
-            # Tool failed — LLM generates a helpful error message
             text = await self._llm_error_explanation(
                 route, tool_result.get("error", ""), language, personality
             )
@@ -221,22 +289,36 @@ class Orchestrator:
         personality:    str,
         history:        list[dict],
         thinking_sound: str,
+        memory_context: str,
+        vector_context: str,
     ) -> OrchestratorResponse:
-        """
-        LLM-powered response.
-        Used for conversation, research, writing, code explanation etc.
-        """
-        # Build message list from history
+        """LLM response with full memory context injected."""
+
+        # Build message list
         messages: list[Message] = []
-        for h in history:
+
+        # Inject memory as system context
+        context_parts = []
+        if memory_context:
+            context_parts.append(memory_context)
+        if vector_context:
+            context_parts.append(vector_context)
+
+        if context_parts:
+            messages.append(Message(
+                role=Role.SYSTEM,
+                content="\n\n".join(context_parts)
+            ))
+
+        # Add conversation history
+        for h in history[-settings.MAX_HISTORY_TURNS * 2:]:
             role = Role.USER if h.get("role") == "user" else Role.ASSISTANT
             messages.append(Message(role=role, content=h.get("content", "")))
 
-        # Add context about the detected intent to help LLM respond better
-        enriched_text = self._enrich_with_intent_context(text, route)
-        messages.append(Message(role=Role.USER, content=enriched_text))
+        # Add current message
+        messages.append(Message(role=Role.USER, content=text))
 
-        # If tool was also needed (e.g. web search), run it first
+        # Tool-assisted LLM (e.g. web search)
         tool_output = None
         tool_name   = None
         if route.tool and route.use_llm:
@@ -244,15 +326,14 @@ class Orchestrator:
             if tool_result.get("success") and tool_result.get("output"):
                 tool_name   = route.tool.value
                 tool_output = tool_result
-                # Inject tool results into context
-                context_msg = (
-                    f"[Tool result from {tool_name}]:\n"
-                    f"{tool_result['output']}\n\n"
-                    f"Use this information to answer the user's question."
-                )
-                messages.append(
-                    Message(role=Role.SYSTEM, content=context_msg)
-                )
+                messages.append(Message(
+                    role=Role.SYSTEM,
+                    content=(
+                        f"[Tool result — {tool_name}]:\n"
+                        f"{tool_result['output']}\n\n"
+                        "Use this to answer the user."
+                    )
+                ))
 
         response = await llm.chat(
             messages=messages,
@@ -278,9 +359,7 @@ class Orchestrator:
         language:       str,
         thinking_sound: str,
     ) -> OrchestratorResponse:
-        """Handle personality switch without LLM."""
         profile = route.params.get("profile", "bro")
-
         confirmations = {
             "en":       f"Switching to {profile} mode.",
             "hi":       f"{profile} mode activate ho gaya.",
@@ -288,10 +367,8 @@ class Orchestrator:
             "mr":       f"{profile} mode switch kela.",
             "ur":       f"{profile} mode mein aa gaya hoon.",
         }
-        text = confirmations.get(language, confirmations["hinglish"])
-
         return OrchestratorResponse(
-            text=text,
+            text=confirmations.get(language, confirmations["hinglish"]),
             intent=route.intent.value,
             used_llm=False,
             thinking_sound=thinking_sound,
@@ -305,14 +382,15 @@ class Orchestrator:
         language:       str,
         personality:    str,
         thinking_sound: str,
+        memory_context: str,
     ) -> OrchestratorResponse:
-        """ICARUS status — quick personality-aware response."""
-        messages = [
-            Message(
-                role=Role.USER,
-                content="How are you doing? Give a short, in-character response."
-            )
-        ]
+        messages = []
+        if memory_context:
+            messages.append(Message(role=Role.SYSTEM, content=memory_context))
+        messages.append(Message(
+            role=Role.USER,
+            content="How are you doing? Give a short in-character response."
+        ))
         response = await llm.chat(
             messages=messages,
             personality=personality,
@@ -335,18 +413,14 @@ class Orchestrator:
         personality:    str,
         thinking_sound: str,
     ) -> OrchestratorResponse:
-        """List ICARUS capabilities in the user's language."""
         prompt = (
-            "List your key capabilities briefly. "
-            "Music, GitHub, web search, code, browser automation, "
-            "memory, RAG knowledge base, personality switching. "
-            "Keep it punchy and in-character."
+            "List your key capabilities briefly — music, GitHub, "
+            "web search, code, browser automation, memory, RAG, "
+            "personality switching. Keep it punchy and in-character."
         )
         messages = [Message(role=Role.USER, content=prompt)]
         response = await llm.chat(
-            messages=messages,
-            personality=personality,
-            language=language,
+            messages=messages, personality=personality, language=language
         )
         return OrchestratorResponse(
             text=response.content,
@@ -358,36 +432,49 @@ class Orchestrator:
             language=language,
         )
 
+    # ── Memory persistence ────────────────────────────────────────
+
+    async def _save_to_memory(
+        self,
+        session_id:  str,
+        user_text:   str,
+        icarus_text: str,
+        intent:      str,
+    ) -> None:
+        """Save the completed exchange to all memory layers."""
+        try:
+            # Short-term — Redis
+            await short_term_memory.add(session_id, "user",      user_text)
+            await short_term_memory.add(session_id, "assistant", icarus_text)
+
+            # Vector — only for substantive conversations
+            if intent in ("conversation", "question", "research", "explain"):
+                await vector_store.store_conversation_turn(
+                    session_id=session_id,
+                    user_msg=user_text,
+                    icarus_msg=icarus_text,
+                )
+        except Exception as e:
+            logger.warning(
+                "Memory save failed — continuing without saving",
+                extra={"error": str(e)}
+            )
+
     # ── Tool execution ────────────────────────────────────────────
 
     async def _execute_tool(self, route: RouteResult) -> dict:
-        """
-        Execute a tool by name.
-        Phase 4 will wire real tool implementations here via the registry.
-        For now returns structured stubs so the pipeline works end-to-end.
-        """
+        """Stub implementations — real tools wired in Phase 4."""
         intent = route.intent
         params = route.params
 
-        # ── Music stubs ───────────────────────────────────────────
         if intent == INTENT.MUSIC_PLAY:
-            query = params.get("query", "")
-            return {
-                "success": True,
-                "output":  f"Playing '{query}' on YouTube",
-                "query":   query,
-            }
-
+            return {"success": True, "output": f"Playing '{params.get('query', '')}'"}
         if intent == INTENT.MUSIC_PAUSE:
             return {"success": True, "output": "Music paused"}
-
         if intent == INTENT.MUSIC_STOP:
             return {"success": True, "output": "Music stopped"}
-
         if intent == INTENT.MUSIC_NEXT:
-            return {"success": True, "output": "Skipped to next track"}
-
-        # ── GitHub stubs ──────────────────────────────────────────
+            return {"success": True, "output": "Skipped to next"}
         if intent == INTENT.GITHUB_CREATE:
             name = params.get("repo_name", "new-repo")
             return {
@@ -395,61 +482,25 @@ class Orchestrator:
                 "output":  f"Repository '{name}' created",
                 "url":     f"https://github.com/{settings.GITHUB_USERNAME}/{name}",
             }
-
         if intent == INTENT.GITHUB_PUSH:
-            return {
-                "success": True,
-                "output":  "Code pushed to GitHub successfully",
-            }
-
+            return {"success": True, "output": "Code pushed to GitHub"}
         if intent == INTENT.GITHUB_LIST:
-            return {
-                "success": True,
-                "output":  "Fetching your repositories...",
-            }
-
-        # ── Web search stub ───────────────────────────────────────
+            return {"success": True, "output": "Fetching your repositories..."}
         if intent == INTENT.WEB_SEARCH:
-            query = params.get("query", "")
             return {
                 "success": True,
-                "output":  f"[Web search results for '{query}' will appear here]",
-                "query":   query,
+                "output": f"[Search results for '{params.get('query', '')}']",
             }
-
-        # ── Browser stub ──────────────────────────────────────────
         if intent == INTENT.BROWSER_OPEN:
-            target = params.get("target", "")
-            return {
-                "success": True,
-                "output":  f"Opening '{target}'",
-            }
-
-        # ── Code stub ─────────────────────────────────────────────
+            return {"success": True, "output": f"Opening '{params.get('target', '')}'"}
         if intent == INTENT.CODE_RUN:
-            return {
-                "success": True,
-                "output":  "Code execution ready — tool coming in Phase 4",
-            }
+            return {"success": True, "output": "Code executor coming in Phase 4"}
 
-        return {"success": False, "error": f"No tool implemented for {intent}"}
+        return {"success": False, "error": f"No tool for {intent}"}
 
     # ── Helpers ───────────────────────────────────────────────────
 
-    def _enrich_with_intent_context(
-        self, text: str, route: RouteResult
-    ) -> str:
-        """
-        Adds intent context to the user message.
-        Helps LLM give more relevant responses.
-        """
-        if route.intent == INTENT.CONVERSATION:
-            return text
-        return f"{text}\n[Detected intent: {route.intent.value}]"
-
     def _pick_thinking_sound(self, language: str) -> str:
-        """Pick a random thinking sound in the right language."""
-        import random
         try:
             lang_enum = LANGUAGE(language)
         except ValueError:
@@ -457,111 +508,50 @@ class Orchestrator:
         sounds = THINKING_SOUNDS.get(lang_enum, ["..."])
         return random.choice(sounds)
 
-    def _tool_success_message(
-        self,
-        intent:   INTENT,
-        params:   dict,
-        language: str,
-    ) -> str:
-        """
-        Short confirmation message after a successful direct tool call.
-        No LLM needed — just a canned response in the right language.
-        """
-        query = params.get("query", "")
+    def _tool_success_message(self, intent, params, language) -> str:
+        query  = params.get("query", "")
         target = params.get("target", "")
         repo   = params.get("repo_name", "")
-
-        messages = {
-            INTENT.MUSIC_PLAY: {
-                "hinglish": f"Haan, '{query}' laga raha hoon.",
-                "hi":       f"'{query}' chala raha hoon.",
-                "en":       f"Playing '{query}'.",
-                "mr":       f"'{query}' lavto.",
-            },
-            INTENT.MUSIC_PAUSE: {
-                "hinglish": "Music pause kar diya.",
-                "hi":       "Music ruk gaya.",
-                "en":       "Music paused.",
-                "mr":       "Music pause kela.",
-            },
-            INTENT.MUSIC_STOP: {
-                "hinglish": "Music band kar diya.",
-                "hi":       "Music band ho gaya.",
-                "en":       "Music stopped.",
-                "mr":       "Music band kela.",
-            },
-            INTENT.MUSIC_NEXT: {
-                "hinglish": "Agla track laga raha hoon.",
-                "hi":       "Agla gaana.",
-                "en":       "Next track.",
-                "mr":       "Pudcha track.",
-            },
-            INTENT.BROWSER_OPEN: {
-                "hinglish": f"'{target}' khol raha hoon.",
-                "hi":       f"'{target}' khul raha hai.",
-                "en":       f"Opening '{target}'.",
-                "mr":       f"'{target}' ughadto.",
-            },
-            INTENT.GITHUB_CREATE: {
-                "hinglish": f"Repo '{repo}' ban gaya bhai.",
-                "hi":       f"Repo '{repo}' ban gaya.",
-                "en":       f"Repository '{repo}' created.",
-                "mr":       f"Repo '{repo}' tayar.",
-            },
-            INTENT.GITHUB_PUSH: {
-                "hinglish": "Code GitHub pe push ho gaya.",
-                "hi":       "Code push ho gaya.",
-                "en":       "Code pushed to GitHub.",
-                "mr":       "Code push jhala.",
-            },
+        msgs = {
+            INTENT.MUSIC_PLAY:  {"hinglish": f"Haan, '{query}' laga raha hoon.", "en": f"Playing '{query}'."},
+            INTENT.MUSIC_PAUSE: {"hinglish": "Music pause kar diya.", "en": "Music paused."},
+            INTENT.MUSIC_STOP:  {"hinglish": "Music band kar diya.", "en": "Music stopped."},
+            INTENT.MUSIC_NEXT:  {"hinglish": "Agla track.", "en": "Next track."},
+            INTENT.BROWSER_OPEN:{"hinglish": f"'{target}' khol raha hoon.", "en": f"Opening '{target}'."},
+            INTENT.GITHUB_CREATE:{"hinglish": f"Repo '{repo}' ban gaya bhai.", "en": f"Repo '{repo}' created."},
+            INTENT.GITHUB_PUSH: {"hinglish": "Code GitHub pe push ho gaya.", "en": "Code pushed."},
         }
+        intent_msgs = msgs.get(intent, {})
+        return intent_msgs.get(language, intent_msgs.get("hinglish", "Done."))
 
-        intent_msgs = messages.get(intent, {})
-        return intent_msgs.get(
-            language,
-            intent_msgs.get("hinglish", "Done.")
-        )
-
-    async def _llm_error_explanation(
-        self,
-        route:      RouteResult,
-        error:      str,
-        language:   str,
-        personality: str,
-    ) -> str:
-        """When a tool fails, LLM explains what went wrong."""
+    async def _llm_error_explanation(self, route, error, language, personality) -> str:
         prompt = (
-            f"A tool failed. Intent was: {route.intent.value}. "
-            f"Error: {error}. "
-            f"Explain this briefly and helpfully to the user."
+            f"A tool failed. Intent: {route.intent.value}. "
+            f"Error: {error}. Explain briefly and helpfully."
         )
         return await llm.quick(prompt, system=f"Language: {language}")
 
-    def _error_response(
-        self,
-        error:          Exception,
-        intent:         str,
-        language:       str,
-        personality:    str,
-        thinking_sound: str,
-    ) -> OrchestratorResponse:
-        """Fallback response when something unexpected goes wrong."""
-        messages = {
+    def _error_response(self, error, intent, language, personality, thinking_sound, session_id) -> OrchestratorResponse:
+        msgs = {
             "hinglish": "Bhai kuch gadbad ho gayi. Dobara try karo.",
             "hi":       "Kuch galat ho gaya. Phir koshish karo.",
             "en":       "Something went wrong. Please try again.",
             "mr":       "Kahi chuk zali. Parat try kara.",
-            "ur":       "Kuch masla hua. Dobara koshish karein.",
         }
-        logger.error("Orchestrator fallback error", extra={"error": str(error)})
+        logger.error("Orchestrator fallback", extra={"error": str(error)})
         return OrchestratorResponse(
-            text=messages.get(language, messages["hinglish"]),
+            text=messages.get(language, msgs["hinglish"]),
             intent=intent,
             used_llm=False,
             thinking_sound=thinking_sound,
             personality=personality,
             language=language,
+            session_id=session_id,
         )
+
+    def _new_session_id(self) -> str:
+        import uuid
+        return uuid.uuid4().hex[:12]
 
 
 # ── Singleton ──────────────────────────────────────────────────────
