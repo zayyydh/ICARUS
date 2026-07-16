@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*.pyo
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+
+# Data (mounted as volumes)
+data/
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.yml
+docker-compose.*.yml
+
+# Secrets — never bake these into image
+.env
+*.env
+
+# Frontend (served separately)
+frontend/
+
+# Tests
+tests/
+
+# Docs
+docs/

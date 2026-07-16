@@ -1,0 +1,17 @@
+# ── Railway deployment config ───────────────────────────────────
+# Deploys the ICARUS backend to Railway free tier
+# https://railway.app
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "docker/Dockerfile.backend"
+
+[deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/api/v1/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+[[services]]
+name = "icarus-backend"

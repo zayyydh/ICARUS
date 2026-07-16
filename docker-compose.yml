@@ -1,0 +1,95 @@
+# ── ICARUS — Full Stack Docker Compose ─────────────────────────
+# Run everything with: docker-compose up -d
+# Stop everything with: docker-compose down
+
+
+services:
+
+  # ── ICARUS Backend ──────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: icarus-backend
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - POSTGRES_URL=postgresql://icarus:icarus@postgres:5432/icarus
+      - REDIS_URL=redis://redis:6379
+      - QDRANT_URL=http://qdrant:6333
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      - ./data:/app/data       # SQLite + uploads persist
+      - ./logs:/app/logs       # Log files persist
+    restart: unless-stopped
+    networks:
+      - icarus-net
+
+  # ── PostgreSQL ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: icarus-postgres
+    environment:
+      POSTGRES_USER:     icarus
+      POSTGRES_PASSWORD: icarus
+      POSTGRES_DB:       icarus
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U icarus"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - icarus-net
+
+  # ── Qdrant (Vector DB) ──────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: icarus-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - icarus-net
+
+  # ── Redis (Session cache) ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: icarus-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - icarus-net
+
+# ── Volumes ─────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:
+
+# ── Network ─────────────────────────────────────────────────────
+networks:
+  icarus-net:
+    driver: bridge
