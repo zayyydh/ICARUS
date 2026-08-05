@@ -6,35 +6,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl git gcc g++ build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Install packages — pinned to known working versions
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
-    fastapi \
-    "uvicorn[standard]" \
-    pydantic \
-    pydantic-settings \
-    google-genai \
-    python-dotenv \
-    httpx \
-    langdetect \
-    pypdf \
-    beautifulsoup4 \
-    PyGithub \
-    sqlalchemy \
-    aiosqlite \
-    redis \
-    numpy \
+    fastapi==0.115.0 \
+    "uvicorn[standard]==0.30.0" \
+    pydantic==2.9.0 \
+    pydantic-settings==2.5.0 \
+    "google-genai==1.5.0" \
+    python-dotenv==1.0.1 \
+    "httpx==0.28.1" \
+    langdetect==1.0.9 \
+    pypdf==4.3.1 \
+    beautifulsoup4==4.12.3 \
+    PyGithub==2.3.0 \
+    sqlalchemy==2.0.36 \
+    aiosqlite==0.20.0 \
+    redis==5.2.0 \
+    numpy==1.26.4 \
     "duckduckgo-search==5.3.1b1"
 
 COPY backend/ ./backend/
-COPY start.sh ./start.sh
-RUN chmod +x ./start.sh
 
 RUN mkdir -p data logs
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app/backend
+    PYTHONPATH=/app/backend \
+    PORT=8000
 
 EXPOSE 8000
 
-CMD ["./start.sh"]
+HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=5 \
+    CMD curl -f http://localhost:8000/api/v1/health || exit 1
+
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
